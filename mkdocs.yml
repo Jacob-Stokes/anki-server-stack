@@ -1,0 +1,51 @@
+site_name: Anki Server Stack
+site_description: A self-hosted Anki sync server, a headless collection and an MCP server, in one Docker Compose project.
+site_url: https://jacob-stokes.github.io/anki-server-stack/
+repo_url: https://github.com/Jacob-Stokes/anki-server-stack
+repo_name: anki-server-stack
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+  features:
+    - navigation.sections
+    - navigation.footer
+    - content.code.copy
+    - search.suggest
+
+markdown_extensions:
+  - tables
+  - admonition
+  - attr_list
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+
+nav:
+  - Overview: index.md
+  - Getting started:
+      - Installer: installer.md
+      - Docker Compose: compose.md
+      - Phones and desktops: devices.md
+  - Using it:
+      - How it works: how-it-works.md
+      - Connecting AI tools: mcp.md
+      - AnkiConnect: ankiconnect.md
+      - The desktop: desktop.md
+      - HTTPS: https.md
+      - Managing with anki-stack: managing.md

@@ -1,0 +1,26 @@
+#!/bin/bash
+# KasmVNC's session start: set up the profile (anki-setup.py), then Anki.
+export LC_ALL=C.UTF-8 DISABLE_QT5_COMPAT=1
+
+if [ -z "${PASSWORD:-}" ]; then
+  echo "anki-desktop: DESKTOP_PASSWORD is not set, so the web page has no login" >&2
+fi
+
+/opt/anki/bin/python /defaults/anki-setup.py
+
+# With AnkiConnect on, sync every 10 minutes through it too (Anki itself
+# syncs when it opens and closes, and when asked)
+if [ "${DESKTOP_ANKICONNECT:-false}" = "true" ]; then
+  (
+    while sleep 600; do
+      curl -s -m 120 http://localhost:8765 -X POST -H 'Content-Type: application/json' \
+        -d "{\"action\":\"sync\",\"version\":6,\"key\":\"${ANKICONNECT_KEY:-}\"}" >/dev/null 2>&1
+    done
+  ) &
+fi
+
+# Anki in a loop: closing its window brings it back
+while true; do
+  /opt/anki/bin/anki
+  sleep 2
+done

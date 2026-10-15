@@ -1,0 +1,31 @@
+name: e2e
+
+# Install with plain Compose, run every MCP tool, sync with a second device
+# (changes both ways, and a full sync it forces mid-change), exercise the
+# CLI (accounts, backup and restore), install again with the installer,
+# uninstall: scripts/test-e2e.sh. The desktop job adds the desktop and its
+# AnkiConnect (a 2–3 GB image).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo bash scripts/test-e2e.sh
+
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo E2E_DESKTOP=1 bash scripts/test-e2e.sh

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Keeps the pinned images, Anki and the MCP library current; each pull request is tested by .github/workflows/e2e.yml.",
+  "extends": [
+    "config:recommended"
+  ],
+  "enabledManagers": [
+    "docker-compose",
+    "dockerfile",
+    "custom.regex",
+    "pip_requirements",
+    "github-actions"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Anki: one version for the sync server, the worker and the desktop (compose.yml and both Dockerfiles)",
+      "managerFilePatterns": [
+        "/^compose\\.yml$/",
+        "/^images/.+/Dockerfile$/",
+        "/^anki-stack$/",
+        "/^scripts/test-e2e\\.sh$/"
+      ],
+      "matchStrings": [
+        "ANKI_VERSION[:=] ?(?<currentValue>\\d+\\.\\d+(\\.\\d+)?)",
+        "anki-stack(-desktop)?:(?<currentValue>\\d+\\.\\d+(\\.\\d+)?)"
+      ],
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "anki"
+    },
+    {
+      "customType": "regex",
+      "description": "The MCP and uvicorn libraries in the Anki image",
+      "managerFilePatterns": [
+        "/^images/anki/Dockerfile$/"
+      ],
+      "matchStrings": [
+        "MCP_VERSION=(?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "mcp"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchDepNames": [
+        "anki"
+      ],
+      "groupName": "Anki"
+    },
+    {
+      "description": "MkDocs 2.0 breaks Material for MkDocs; stay on 1.x",
+      "matchPackageNames": [
+        "mkdocs"
+      ],
+      "allowedVersions": "<2"
+    }
+  ]
+}

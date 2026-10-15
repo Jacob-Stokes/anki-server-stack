@@ -1,0 +1,180 @@
+# Anki Server Stack: Anki's sync server, a headless Anki collection with an
+# AnkiConnect-style API, and an MCP server, as one compose project.
+# `docker compose up -d` with a filled-in .env is a complete install. The
+# optional desktop (full Anki in a browser, with the real AnkiConnect
+# add-on) is the `desktop` profile. All data is in ./data. See README.md.
+
+name: ${INSTANCE_PREFIX:-}anki
+
+x-anki-image: &anki-image
+  image: ${INSTANCE_PREFIX:-}anki-stack:26.9.3
+  build:
+    context: .
+    dockerfile: images/anki/Dockerfile
+    args:
+      ANKI_VERSION: 26.9.3
+
+services:
+  # Anki's own sync server: phones (AnkiDroid, AnkiMobile), desktops and the
+  # worker all sync with it. The first user is ANKI_USER; more in users.env.
+  anki-sync:
+    <<: *anki-image
+    container_name: ${INSTANCE_PREFIX:-}anki-sync
+    restart: unless-stopped
+    environment:
+      SYNC_USER1: ${ANKI_USER:?Set ANKI_USER in .env}:${ANKI_PASSWORD:?Set ANKI_PASSWORD in .env}
+      MAX_SYNC_PAYLOAD_MEGS: ${MAX_SYNC_PAYLOAD_MEGS:-250}
+    # SYNC_USER2=name:password, … for more people (anki-stack users add)
+    env_file:
+      - path: users.env
+        required: false
+    ports:
+      - "${SYNC_BIND:-127.0.0.1:8070}:8080"
+    volumes:
+      - ./data/sync:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # The worker: its own copy of ANKI_USER's collection, synced with
+  # anki-sync, behind an AnkiConnect-compatible API (ANKICONNECT_KEY). The
+  # MCP server uses it; other AnkiConnect tools can too, at ANKICONNECT_BIND.
+  anki-worker:
+    <<: *anki-image
+    container_name: ${INSTANCE_PREFIX:-}anki-worker
+    restart: unless-stopped
+    command: ["python", "-m", "ankistack", "worker"]
+    stop_grace_period: 30s
+    environment:
+      ANKI_USER: ${ANKI_USER}
+      ANKI_PASSWORD: ${ANKI_PASSWORD}
+      ANKICONNECT_KEY: ${ANKICONNECT_KEY:?Set ANKICONNECT_KEY in .env}
+      ANKICONNECT_CORS: ${ANKICONNECT_CORS:-}
+      SYNC_URL: http://anki-sync:8080/
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-5}
+      DATA_DIR: /data
+    ports:
+      - "${ANKICONNECT_BIND:-127.0.0.1:8765}:8765"
+    volumes:
+      - ./data/worker:/data
+    depends_on:
+      anki-sync:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # The MCP server: Streamable HTTP at /mcp, bearer token MCP_BEARER_TOKEN.
+  # MCP_ANKI_URL picks its AnkiConnect: the worker, or the desktop's add-on.
+  anki-mcp:
+    <<: *anki-image
+    container_name: ${INSTANCE_PREFIX:-}anki-mcp
+    restart: unless-stopped
+    command: ["python", "-m", "ankistack", "mcp"]
+    environment:
+      ANKI_URL: ${MCP_ANKI_URL:-http://anki-worker:8765}
+      ANKICONNECT_KEY: ${ANKICONNECT_KEY}
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:?Set MCP_BEARER_TOKEN in .env}
+      PORT: 8080
+    ports:
+      - "${MCP_BIND:-127.0.0.1:7012}:8080"
+    depends_on:
+      anki-worker:
+        condition: service_healthy
+
+  # --- optional: full Anki in a browser (profile "desktop") ----------------------
+  # The desktop app in a web page (KasmVNC), signed in to anki-sync. With
+  # DESKTOP_ANKICONNECT=true it also runs the real AnkiConnect add-on, for
+  # tools that need more than the worker's API (DESKTOP_ANKICONNECT_BIND).
+  anki-desktop:
+    image: ${INSTANCE_PREFIX:-}anki-stack-desktop:26.9.3
+    build:
+      context: images/desktop
+      args:
+        ANKI_VERSION: 26.9.3
+    container_name: ${INSTANCE_PREFIX:-}anki-desktop
+    profiles: [desktop]
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: ${TZ:-UTC}
+      TITLE: Anki
+      CUSTOM_USER: ${DESKTOP_USER:-anki}
+      PASSWORD: ${DESKTOP_PASSWORD:-}
+      ANKI_USER: ${ANKI_USER}
+      ANKI_PASSWORD: ${ANKI_PASSWORD}
+      ANKI_SYNC_URL: http://anki-sync:8080/
+      DESKTOP_ANKICONNECT: ${DESKTOP_ANKICONNECT:-false}
+      ANKICONNECT_KEY: ${ANKICONNECT_KEY}
+      ANKICONNECT_CORS: ${ANKICONNECT_CORS:-}
+    ports:
+      - "${DESKTOP_BIND:-127.0.0.1:3000}:3000"
+      - "${DESKTOP_ANKICONNECT_BIND:-127.0.0.1:8766}:8765"
+    volumes:
+      - ./data/desktop:/config
+    shm_size: 1gb
+    depends_on:
+      anki-sync:
+        condition: service_healthy
+
+  # --- optional HTTPS: one of these profiles (COMPOSE_PROFILES in .env) ----------
+  # The sync server at https://<domain>/ (what phones are given) and the MCP
+  # server at https://<domain>/mcp.
+
+  # A domain pointing at this server, with certificates from Let's Encrypt
+  caddy:
+    image: caddy:2.10
+    container_name: ${INSTANCE_PREFIX:-}anki-caddy
+    profiles: [caddy]
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy:/data
+    depends_on:
+      anki-sync:
+        condition: service_healthy
+
+  # Private to a tailnet: https://<TS_HOSTNAME>.<tailnet>.ts.net
+  tailscale:
+    image: tailscale/tailscale:v1.88
+    container_name: ${INSTANCE_PREFIX:-}anki-tailscale
+    profiles: [tailscale]
+    restart: unless-stopped
+    hostname: ${TS_HOSTNAME:-anki}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_USERSPACE: "true"
+      TS_ACCEPT_DNS: "false"
+    volumes:
+      - ./data/tailscale:/var/lib/tailscale
+      - ./config/ts-serve.json:/config/serve.json:ro
+    depends_on:
+      anki-sync:
+        condition: service_healthy
+
+  # A Cloudflare Tunnel (no open ports); its routes are set in Cloudflare:
+  # <domain> → http://anki-sync:8080 and <domain>/mcp → http://anki-mcp:8080
+  cloudflared:
+    image: cloudflare/cloudflared:2025.9.1
+    container_name: ${INSTANCE_PREFIX:-}anki-cloudflared
+    profiles: [cloudflare]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:-}
+    depends_on:
+      anki-sync:
+        condition: service_healthy

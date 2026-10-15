@@ -1,0 +1,9 @@
+data/
+backups/
+.env
+users.env
+compose.override.yml
+docker-compose.override.yml
+__pycache__/
+*.pyc
+site/
