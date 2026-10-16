@@ -420,6 +420,8 @@ choose_https() {
   [ -n "$cf" ] && found+="  ${C_OK}•${C_0} cloudflared is already running here"$'\n'
   [ -n "$found" ] && { echo; info "Found on this machine:"; printf '%s' "$found"; }
   if [ -n "$web" ]; then def=7; elif [ -n "$ts" ]; then def=5; elif [ -n "$cf" ]; then def=6; fi
+  # a suggestion, for a person to accept: scripted runs (--yes) only act on --https
+  [ -n "$NONINTERACTIVE" ] && def=1
   local x2="" x5="" x6="" x7=""
   [ -n "$web" ] && x2=" ${C_WARN}(80/443 taken)${C_0}"
   [ -n "$ts" ] && x5=" ${C_OK}(found)${C_0}"
@@ -638,6 +640,7 @@ cmd_address() {
   [ -f .env ] || die "no .env yet — run: $ME install"
   load_env
   local old_port="${TS_SERVE_PORT:-}"
+  need https "the address (--https …)"
   choose_https
   load_env
   # a tailscale serve route this stack set up and no longer uses
