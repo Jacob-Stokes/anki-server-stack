@@ -159,8 +159,41 @@ mcp http://127.0.0.1:17013/mcp "$token_b" anki_metadata '{"action":"list_decks"}
 [ "$(stat -c %a .env)" = 600 ] || fail ".env is private (600)"
 pass "install --yes: secrets generated, MCP server answering"
 
+echo "== 6b. the address step: what's already on this machine"
+mkdir -p "$WORK/fakebin"
+# a stand-in for this machine's Tailscale: on a tailnet, 443 already served
+cat > "$WORK/fakebin/tailscale" <<EOF
+#!/bin/sh
+case "\$*" in
+  "ip -4") echo 100.64.0.9 ;;
+  "status --json") echo '{"Self":{"DNSName":"box.tail1234.ts.net."}}' ;;
+  "serve status --json") echo '{"TCP":{"443":{"HTTPS":true}}}' ;;
+  *) echo "\$*" >> "$WORK/fakebin/serve.log" ;;
+esac
+EOF
+chmod +x "$WORK/fakebin/tailscale"
+PATH="$WORK/fakebin:$PATH" ./anki-stack address --yes --https host-tailscale --tailscale-serve yes --tailnet-extras no </dev/null >"$WORK/address.log" 2>&1 \
+  || { tail -20 "$WORK/address.log"; fail "address: this machine's Tailscale"; }
+grep -q '^PUBLIC_URL="https://box.tail1234.ts.net:10443"' .env && grep -q '^PUBLIC_MCP_URL="https://box.tail1234.ts.net:10443/mcp"' .env \
+  || fail "tailscale serve on the first free port (443 taken): $(grep PUBLIC .env)"
+grep -q -- '--https=10443 http://127.0.0.1:18071' "$WORK/fakebin/serve.log" && grep -q -- '--set-path=/mcp http://127.0.0.1:17013/mcp' "$WORK/fakebin/serve.log" \
+  || fail "tailscale serve routes: $(cat "$WORK/fakebin/serve.log")"
+grep -qE '^SYNC_BIND="?127.0.0.1:18071"?$' .env || fail "with tailscale serve the stack stays on 127.0.0.1"
+pass "this machine's Tailscale: tailscale serve on a free port, no extra container"
+PATH="$WORK/fakebin:$PATH" ./anki-stack address --yes --https proxy --url https://anki.example.com </dev/null >"$WORK/address.log" 2>&1 \
+  || { tail -20 "$WORK/address.log"; fail "address: an existing proxy"; }
+[ -s data/proxy-example.txt ] && grep -q '127.0.0.1:18071' data/proxy-example.txt || fail "a proxy snippet for the sync server"
+grep -q -- '--https=10443 off' "$WORK/fakebin/serve.log" || fail "the old tailscale serve route is removed"
+pass "an existing reverse proxy: a config snippet, and the old tailscale serve route removed"
+python3 -m http.server 80 --bind 127.0.0.1 >/dev/null 2>&1 & held=$!
+sleep 1
+out="$(PATH="$WORK/fakebin:$PATH" ./anki-stack address --yes --https caddy --domain anki.example.com </dev/null 2>&1)" && { kill $held; fail "the stack's Caddy is refused when 80/443 are taken"; }
+kill $held
+grep -q 'ports 80/443 are in use' <<<"$out" || fail "it says why: $out"
+pass "ports 80/443 already taken: the stack's own Caddy is refused, with the alternative"
+
 echo "== 7. uninstall"
-./anki-stack uninstall --yes </dev/null >/dev/null
+PATH="$WORK/fakebin:$PATH" ./anki-stack uninstall --yes </dev/null >/dev/null
 [ -z "$(docker ps -aq --filter name=e2e-b-)" ] || fail "uninstall removed the containers"
 [ -d data/sync ] || fail "uninstall --yes keeps the data"
 pass "uninstall (data kept)"

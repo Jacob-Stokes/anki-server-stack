@@ -9,6 +9,7 @@
 | `anki-stack status` | Containers, the sync server's address, the worker's collection (notes, last sync, any error), the MCP server |
 | `anki-stack logs [sync\|worker\|mcp\|desktop] [-f]` | Recent logs |
 | `anki-stack restart [service]` | Restart one service, or everything |
+| `anki-stack address` | Change how the stack is reached (the installer's address step, then applied) |
 | `anki-stack endpoint [--show-token]` | The MCP endpoint and token; the AnkiConnect addresses and key |
 | `anki-stack sync` | Sync the worker now |
 | `anki-stack sync --download` / `--upload` | Replace the worker's copy with the server's, or the server's with the worker's (asks first) |

@@ -209,6 +209,7 @@ Usage: anki-stack [--dir PATH] <command> [options]
 
   install             set up (or repair) this install: asks a few questions,
                       writes .env, then docker compose up -d
+  address             change how it's reached (HTTPS, Tailscale, a proxy…)
   status              containers, sync, the worker's collection, the MCP server
   logs [SERVICE] [-f] recent logs (sync, worker, mcp, desktop, caddy, …)
   restart [SERVICE]   restart one service, or everything
@@ -230,8 +231,10 @@ Usage: anki-stack [--dir PATH] <command> [options]
 
 Without questions (for scripts): install --yes with --user NAME,
 --password-env VAR, --tz, --desktop yes|no, --desktop-ankiconnect yes|no,
---https none|caddy|tailscale|cloudflare|proxy, --domain, --url,
---acme-email; secrets (TS_AUTHKEY, CF_TUNNEL_TOKEN) from the environment.
+--https none|caddy|tailscale|cloudflare (run by the stack) or
+host-tailscale|host-cloudflare|proxy (already on this machine), --domain,
+--url, --acme-email, --tailscale-serve yes|no, --tailnet-extras yes|no;
+secrets (TS_AUTHKEY, CF_TUNNEL_TOKEN) from the environment.
 USAGE
 }
 
@@ -296,7 +299,6 @@ local_url() { local b="$1"; b="${b/0.0.0.0/127.0.0.1}"; [[ "$b" == *:* ]] || b="
 sync_url() { local_url "${SYNC_BIND:-127.0.0.1:8070}"; }
 mcp_url() { local_url "${MCP_BIND:-127.0.0.1:7012}"; }
 ac_url() { local_url "${ANKICONNECT_BIND:-127.0.0.1:8765}"; }
-public_url() { load_env; case "${COMPOSE_PROFILES:-}" in *caddy*|*cloudflare*) echo "https://${DOMAIN}" ;; *tailscale*) echo "${PUBLIC_URL:-}" ;; *) echo "${PUBLIC_URL:-}" ;; esac; }
 has_profile() { [[ ",${COMPOSE_PROFILES:-}," == *",$1,"* ]]; }
 # set_profile NAME on|off — COMPOSE_PROFILES is a comma-separated list
 set_profile() {
@@ -318,47 +320,200 @@ guess_tz() {
   echo "${tz:-UTC}"
 }
 
+# --- what's already on this machine ---------------------------------------------
+# So the address step can offer to use it, rather than run a second one.
+
+# what listens on ports 80/443 (a process name, or "something"), if not ours
+ports_web_taken() {
+  local who
+  docker container inspect "${P}anki-caddy" >/dev/null 2>&1 && [ "$(docker inspect -f '{{.State.Running}}' "${P}anki-caddy")" = true ] && return 1
+  who="$(ss -ltnpH '( sport = :80 or sport = :443 )' 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u | paste -sd, -)"
+  [ -n "$who" ] || who="$(ss -ltnH '( sport = :80 or sport = :443 )' 2>/dev/null | head -1 | grep -q . && echo something)"
+  [ -n "$who" ] && echo "$who"
+}
+# this machine's Tailscale: "IP NAME" (NAME is <machine>.<tailnet>.ts.net)
+host_tailscale() {
+  command -v tailscale >/dev/null 2>&1 || return 1
+  local ip name
+  ip="$(tailscale ip -4 2>/dev/null | head -1)"; [ -n "$ip" ] || return 1
+  name="$(tailscale status --json 2>/dev/null | sed -n 's/.*"DNSName": *"\([^"]*\)\.".*/\1/p' | head -1)"
+  echo "$ip ${name:-}"
+}
+# a cloudflared already running here (a service or a container), not ours
+host_cloudflared() {
+  pgrep -x cloudflared >/dev/null 2>&1 && ! docker container inspect "${P}anki-cloudflared" >/dev/null 2>&1 && return 0
+  docker ps --format '{{.Image}} {{.Names}}' 2>/dev/null | grep -v " ${P}anki-cloudflared$" | grep -q '^cloudflare/cloudflared'
+}
+# the first HTTPS port `tailscale serve` isn't using: 443, else 10443 upwards
+free_serve_port() {
+  local used p; used="$(tailscale serve status --json 2>/dev/null | grep -oE '"[0-9]+": *\{' | grep -oE '[0-9]+')"
+  for p in 443 $(seq 10443 10499); do grep -qx "$p" <<<"$used" || { echo "$p"; return; }; done
+}
+# set_bind VAR HOST — keep the port, change the address it listens on
+set_bind() { local cur; cur="$(env_get "$1")"; cur="${cur:-$2:0}"; set_env .env "$1" "$2:${cur##*:}" force; }
+port_of() { local v; v="$(env_get "$1")"; echo "${v##*:}"; }
+
+# The snippets for a proxy already running here, written to data/ and shown
+proxy_snippet() {
+  local kind="$1" host="$2" sp mp f=data/proxy-example.txt; sp="$(port_of SYNC_BIND)"; mp="$(port_of MCP_BIND)"
+  case "$kind" in
+    *caddy*) cat > "$f" <<EOF
+# Caddyfile: the sync server at the root, the MCP server at /mcp
+$host {
+	handle /mcp* {
+		reverse_proxy 127.0.0.1:$mp
+	}
+	handle {
+		reverse_proxy 127.0.0.1:$sp
+	}
+}
+EOF
+    ;;
+    *nginx*) cat > "$f" <<EOF
+# nginx: the sync server at the root, the MCP server at /mcp
+server {
+    server_name $host;
+    client_max_body_size 512M;   # whole-collection uploads
+    location /mcp {
+        proxy_pass http://127.0.0.1:$mp;
+        proxy_http_version 1.1;
+        proxy_buffering off;     # streamed MCP responses
+    }
+    location / {
+        proxy_pass http://127.0.0.1:$sp;
+    }
+    # plus your usual listen 443 ssl; and certificate lines
+}
+EOF
+    ;;
+    cloudflared) cat > "$f" <<EOF
+# cloudflared (config.yml ingress, above the catch-all rule), or the same two
+# public hostname routes in the Cloudflare dashboard:
+  - hostname: $host
+    path: ^/mcp
+    service: http://localhost:$mp
+  - hostname: $host
+    service: http://localhost:$sp
+EOF
+    ;;
+    *) cat > "$f" <<EOF
+# Any reverse proxy: for $host,
+#   /mcp (and below)  →  http://127.0.0.1:$mp   (no response buffering)
+#   everything else   →  http://127.0.0.1:$sp   (allow large request bodies)
+EOF
+    ;;
+  esac
+  sed 's/^/    /' "$f"; info "(saved in $f)"
+  info "If the proxy runs in a container, 127.0.0.1 is the container itself: point it at an address of"
+  info "this machine it can reach, and set SYNC_BIND / MCP_BIND in .env to listen there."
+}
+
 choose_https() {
-  local choice
+  local choice def=1 web ts ts_ip ts_name cf
+  web="$(ports_web_taken || true)"; ts="$(host_tailscale || true)"; ts_ip="${ts%% *}"; ts_name="${ts#* }"; [ "$ts_name" = "$ts" ] && ts_name=""
+  cf=""; host_cloudflared && cf=1
   say "Address"
   info "Phones and desktops sync with the sync server; give them its address."
+  local found=""
+  [ -n "$web" ] && found+="  ${C_WARN}•${C_0} ports 80/443 are in use (${web}): a web server or proxy is already running"$'\n'
+  [ -n "$ts" ] && found+="  ${C_OK}•${C_0} this machine is on Tailscale (${ts_name:-$ts_ip})"$'\n'
+  [ -n "$cf" ] && found+="  ${C_OK}•${C_0} cloudflared is already running here"$'\n'
+  [ -n "$found" ] && { echo; info "Found on this machine:"; printf '%s' "$found"; }
+  if [ -n "$web" ]; then def=7; elif [ -n "$ts" ]; then def=5; elif [ -n "$cf" ]; then def=6; fi
+  local x2="" x5="" x6="" x7=""
+  [ -n "$web" ] && x2=" ${C_WARN}(80/443 taken)${C_0}"
+  [ -n "$ts" ] && x5=" ${C_OK}(found)${C_0}"
+  [ -n "$cf" ] && x6=" ${C_OK}(found)${C_0}"
+  [ -n "$web" ] && x7=" ${C_OK}(found: $web)${C_0}"
   cat <<EOM
 
-  ${C_ACC}1${C_0}  ${C_B}This machine only${C_0}        $(sync_url) (elsewhere: an SSH tunnel)
-  ${C_ACC}2${C_0}  ${C_B}A domain, with HTTPS${C_0}     Caddy and Let's Encrypt; the domain must point here
-  ${C_ACC}3${C_0}  ${C_B}Tailscale${C_0}                https://<name>.<tailnet>.ts.net, private to a tailnet
-  ${C_ACC}4${C_0}  ${C_B}Cloudflare Tunnel${C_0}        a domain on Cloudflare, no open ports
-  ${C_ACC}5${C_0}  ${C_B}A reverse proxy${C_0}          one already running here forwards a domain
+  ${C_DIM}New, run by this stack${C_0}
+  ${C_ACC}1${C_0}  ${C_B}This machine only${C_0}             $(sync_url) (elsewhere: an SSH tunnel)
+  ${C_ACC}2${C_0}  ${C_B}A domain, with HTTPS${C_0}          its own Caddy and Let's Encrypt; needs ports 80/443${x2}
+  ${C_ACC}3${C_0}  ${C_B}Tailscale, as its own machine${C_0} https://<name>.<tailnet>.ts.net, private to a tailnet
+  ${C_ACC}4${C_0}  ${C_B}A Cloudflare Tunnel${C_0}           its own tunnel; a domain on Cloudflare, no open ports
+  ${C_DIM}Already on this machine${C_0}
+  ${C_ACC}5${C_0}  ${C_B}This machine's Tailscale${C_0}      no extra container${x5}
+  ${C_ACC}6${C_0}  ${C_B}Its Cloudflare Tunnel${C_0}         add two routes to the tunnel you have${x6}
+  ${C_ACC}7${C_0}  ${C_B}Its reverse proxy${C_0}             Caddy, nginx, Traefik…: forward a domain here${x7}
 
 EOM
-  ask "Choice [1]: " choice https
+  ask "Choice [$def]: " choice https
+  choice="${choice:-$def}"
   for p in caddy tailscale cloudflare; do set_profile "$p" off; done
-  case "${choice:-1}" in
+  set_env .env PUBLIC_MCP_URL "" force
+  case "$choice" in
     1|none) set_env .env PUBLIC_URL "" force ;;
     2|caddy)
+      if [ -n "$web" ]; then
+        warn "Ports 80/443 are in use ($web); the stack's Caddy couldn't start. Option 7 uses what's there."
+        [ -z "$NONINTERACTIVE" ] || die "ports 80/443 are in use ($web): use --https proxy (or free them)"
+        local go; ask "Use Caddy anyway? [y/N] " go; case "$go" in [yY]*) ;; *) choose_https; return ;; esac
+      fi
       local d e; need domain "the domain"; ask "Domain (e.g. anki.example.com): " d domain; [ -n "$d" ] || die "a domain is needed"
       ask "Email for Let's Encrypt (renewal notices): " e acme-email
       set_profile caddy on; set_env .env DOMAIN "$d" force; set_env .env ACME_EMAIL "$e" force
-      set_env .env PUBLIC_URL "https://$d" force ;;
+      set_env .env PUBLIC_URL "https://$d" force; set_env .env PUBLIC_MCP_URL "https://$d/mcp" force ;;
     3|tailscale)
       local k h; ask_secret "Tailscale auth key (hidden; admin console → Settings → Keys): " k TS_AUTHKEY
       [ -n "$k" ] || die "an auth key is needed (TS_AUTHKEY)"
       ask "Machine name on the tailnet [anki]: " h ts-hostname
       set_profile tailscale on; set_env .env TS_AUTHKEY "$k" force; set_env .env TS_HOSTNAME "${h:-anki}" force ;;
+    5|host-tailscale)
+      [ -n "$ts" ] || die "Tailscale isn't running on this machine (tailscale ip -4 gives nothing)"
+      choose_host_tailscale "$ts_ip" "$ts_name" ;;
     4|cloudflare)
       local t d; ask_secret "Tunnel token (hidden; Zero Trust → Networks → Tunnels): " t CF_TUNNEL_TOKEN
       [ -n "$t" ] || die "a tunnel token is needed (CF_TUNNEL_TOKEN)"
       need domain "the domain"; ask "Its public hostname (e.g. anki.example.com): " d domain
       set_profile cloudflare on; set_env .env CF_TUNNEL_TOKEN "$t" force; set_env .env DOMAIN "$d" force
-      set_env .env PUBLIC_URL "https://$d" force
+      set_env .env PUBLIC_URL "https://$d" force; set_env .env PUBLIC_MCP_URL "https://$d/mcp" force
       info "In Cloudflare, route $d to http://anki-sync:8080, and $d/mcp to http://anki-mcp:8080." ;;
-    5|proxy)
-      local u; need url "the public URL"; ask "Public URL (e.g. https://anki.example.com): " u url
+    6|host-cloudflare)
+      local d; need domain "the hostname"; ask "Hostname to use (e.g. anki.example.com): " d domain; [ -n "$d" ] || die "a hostname is needed"
+      set_env .env PUBLIC_URL "https://$d" force; set_env .env PUBLIC_MCP_URL "https://$d/mcp" force
+      echo; info "Add these routes to your tunnel, then restart cloudflared:"; proxy_snippet cloudflared "$d" ;;
+    7|proxy)
+      local u kind; need url "the public URL"; ask "Public URL (e.g. https://anki.example.com): " u url
       [[ "$u" == http*://* ]] || die "the URL should start with https:// (or http://)"
-      set_env .env PUBLIC_URL "${u%/}" force
-      info "Point the proxy at $(sync_url) for the sync server and $(mcp_url) for /mcp." ;;
+      set_env .env PUBLIC_URL "${u%/}" force; set_env .env PUBLIC_MCP_URL "${u%/}/mcp" force
+      kind="${web:-generic}"; echo; info "For your proxy ($kind):"; proxy_snippet "$kind" "$(sed -E 's|^https?://||; s|/.*||' <<<"$u")" ;;
     *) die "not a choice: $choice" ;;
   esac
+}
+
+# Option 4: this machine's own Tailscale. Either `tailscale serve` gives
+# HTTPS at https://<machine>.<tailnet>.ts.net[:port] (the stack stays on
+# 127.0.0.1), or the stack listens on the Tailscale address itself (plain HTTP
+# inside the tailnet, which WireGuard already encrypts).
+choose_host_tailscale() {
+  local ip="$1" name="$2" ans port
+  if [ -n "$name" ]; then
+    para <<'EOM'
+`tailscale serve` can give it an HTTPS address on the tailnet, with a
+certificate; some apps (and phones) insist on HTTPS.
+EOM
+    ask "Serve it over HTTPS with tailscale serve? [Y/n] " ans tailscale-serve
+  else ans=n; fi
+  case "$ans" in
+    [nN]*)
+      set_bind SYNC_BIND "$ip"; set_bind MCP_BIND "$ip"
+      set_env .env PUBLIC_URL "http://$ip:$(port_of SYNC_BIND)" force
+      set_env .env PUBLIC_MCP_URL "http://$ip:$(port_of MCP_BIND)/mcp" force ;;
+    *)
+      port="$(free_serve_port)"; [ -n "$port" ] || die "no free HTTPS port for tailscale serve"
+      [ "$port" = 443 ] || info "tailscale serve already uses 443 here; using port $port."
+      tailscale serve --bg --yes --https="$port" "http://127.0.0.1:$(port_of SYNC_BIND)" >>"$LOG" 2>&1 \
+        && tailscale serve --bg --yes --https="$port" --set-path=/mcp "http://127.0.0.1:$(port_of MCP_BIND)/mcp" >>"$LOG" 2>&1 \
+        || die "tailscale serve failed (see $LOG); as root, with Tailscale's HTTPS certificates enabled for the tailnet"
+      local base="https://$name"; [ "$port" = 443 ] || base="$base:$port"
+      set_env .env PUBLIC_URL "$base" force; set_env .env PUBLIC_MCP_URL "$base/mcp" force
+      set_env .env TS_SERVE_PORT "$port" force
+      ok "tailscale serve: $base (the sync server) and $base/mcp" ;;
+  esac
+  # the desktop and the AnkiConnect API, if used, are also most useful on the tailnet
+  ask "Also make the desktop and the AnkiConnect API reachable on the tailnet ($ip)? [Y/n] " ans tailnet-extras
+  case "$ans" in [nN]*) ;; *) set_bind ANKICONNECT_BIND "$ip"; set_bind DESKTOP_BIND "$ip" ;; esac
 }
 
 choose_desktop() {
@@ -445,7 +600,7 @@ cmd_install() {
   kv "Sync server" "$(sync_url)${PUBLIC_URL:+  ·  ${PUBLIC_URL}}"
   kv "Account" "${ANKI_USER}"
   [ -n "$generated" ] && kv "Password" "${C_B}${pw}${C_0} ${C_DIM}(in .env as ANKI_PASSWORD)${C_0}"
-  kv "MCP server" "$(mcp_url)/mcp${PUBLIC_URL:+  ·  ${PUBLIC_URL}/mcp}"
+  kv "MCP server" "$(mcp_url)/mcp${PUBLIC_MCP_URL:+  ·  ${PUBLIC_MCP_URL}}"
   kv "Bearer token" "${MCP_BEARER_TOKEN:0:6}… ${C_DIM}(full: $ME endpoint --show-token)${C_0}"
   kv "AnkiConnect" "$(ac_url) ${C_DIM}(key: $ME endpoint --show-token)${C_0}"
   if has_profile desktop; then kv "Desktop" "$(local_url "${DESKTOP_BIND:-127.0.0.1:3000}")  ${C_DIM}login ${DESKTOP_USER:-anki} / ${DESKTOP_PASSWORD}${C_0}"; fi
@@ -462,7 +617,7 @@ tailscale_url() {
     [ -n "$dom" ] && break; sleep 2
   done
   [ -n "$dom" ] || { warn "Tailscale hasn't joined the tailnet yet; its address will be https://<name>.<tailnet>.ts.net"; return; }
-  set_env .env PUBLIC_URL "https://$dom" force
+  set_env .env PUBLIC_URL "https://$dom" force; set_env .env PUBLIC_MCP_URL "https://$dom/mcp" force
   ok "Tailscale address: https://$dom"
 }
 
@@ -476,6 +631,27 @@ offer_link() {
 cmd_link() {
   local name="${1:-anki-stack${P:+-${P%-}}}"
   ln -sfn "$ROOT/anki-stack" "/usr/local/bin/$name" 2>/dev/null && ok "Added the '$name' command" || warn "couldn't write /usr/local/bin/$name (not root?)"
+}
+
+# anki-stack address: change how the stack is reached, after installing
+cmd_address() {
+  [ -f .env ] || die "no .env yet — run: $ME install"
+  load_env
+  local old_port="${TS_SERVE_PORT:-}"
+  choose_https
+  load_env
+  # a tailscale serve route this stack set up and no longer uses
+  if [ -n "$old_port" ] && [ "${TS_SERVE_PORT:-}" = "$old_port" ] && [[ "${PUBLIC_URL:-}" != https://*.ts.net* ]]; then
+    tailscale serve --https="$old_port" off >>"$LOG" 2>&1 && ok "Removed the tailscale serve route on port $old_port"
+    set_env .env TS_SERVE_PORT "" force
+  fi
+  if docker container inspect "${P}anki-sync" >/dev/null 2>&1; then
+    step "Applying" dc --progress plain up -d --remove-orphans || die "it didn't start: $ME logs"
+    has_profile tailscale && tailscale_url
+  fi
+  say "Address"
+  kv "Sync server" "$(sync_url)${PUBLIC_URL:+  ·  ${PUBLIC_URL}}"
+  kv "MCP server" "$(mcp_url)/mcp${PUBLIC_MCP_URL:+  ·  ${PUBLIC_MCP_URL}}"
 }
 
 # --- day to day ----------------------------------------------------------------------
@@ -532,7 +708,7 @@ cmd_endpoint() {
   local show=""; { [ "${1:-}" = "--show-token" ] || [ -n "${PRESET[show-token]:-}" ]; } && show=1
   say "MCP server"
   kv "On this machine" "$(mcp_url)/mcp"
-  [ -n "${PUBLIC_URL:-}" ] && kv "Public" "${PUBLIC_URL}/mcp"
+  [ -n "${PUBLIC_MCP_URL:-}" ] && kv "Public" "${PUBLIC_MCP_URL}"
   if [ -n "$show" ]; then kv "Bearer token" "$MCP_BEARER_TOKEN"; else kv "Bearer token" "${MCP_BEARER_TOKEN:0:6}… ${C_DIM}(--show-token to print it)${C_0}"; fi
   info 'Clients send it as: Authorization: Bearer <token>'
   say "AnkiConnect"
@@ -720,6 +896,9 @@ cmd_uninstall() {
   info "Stops and removes this install's containers. Data stays in data/ unless chosen."
   if [ -z "$NONINTERACTIVE" ]; then ask "Continue? [y/N] " ans; case "$ans" in [yY]*) ;; *) info "Nothing removed."; return ;; esac; fi
   COMPOSE_PROFILES="desktop,caddy,tailscale,cloudflare" dc down --remove-orphans >/dev/null 2>&1 && ok "Removed the containers"
+  if [ -n "${TS_SERVE_PORT:-}" ] && command -v tailscale >/dev/null 2>&1; then
+    tailscale serve --https="$TS_SERVE_PORT" off >/dev/null 2>&1 && ok "Removed the tailscale serve route (port $TS_SERVE_PORT)"
+  fi
   docker image rm "${P}anki-stack:26.9.3" "${P}anki-stack-desktop:26.9.3" >/dev/null 2>&1 || true
   for link in /usr/local/bin/*; do [ -L "$link" ] && [ "$(readlink -f "$link")" = "$ROOT/anki-stack" ] && rm -f "$link" && ok "Removed command $(basename "$link")"; done
   if [ -z "$NONINTERACTIVE" ]; then
@@ -739,7 +918,7 @@ while [ $# -gt 0 ]; do
     --show-token) PRESET[show-token]=1; ARGS+=("$1") ;;
     --download|--upload) ARGS+=("$1") ;;
     --tail) PRESET[tail]="${2:?}"; shift ;;
-    --user|--tz|--https|--domain|--url|--acme-email|--ts-hostname|--desktop|--desktop-ankiconnect)
+    --user|--tz|--https|--domain|--url|--acme-email|--ts-hostname|--desktop|--desktop-ankiconnect|--tailscale-serve|--tailnet-extras)
       k="${1#--}"; PRESET[$k]="${2:?$1 needs a value}"; shift ;;
     --password-env) PRESET_PASSWORD="${!2:?$2 is empty}"; shift ;;
     *) ARGS+=("$1") ;;
@@ -750,6 +929,7 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   install) cmd_install ;;
+  address) cmd_address ;;
   status) cmd_status ;;
   logs) cmd_logs "$@" ;;
   restart) cmd_restart "$@" ;;
